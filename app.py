@@ -2,12 +2,27 @@ from __future__ import annotations
 
 import hmac
 import json
+import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import Any
 
 import requests
-from flask import Flask, jsonify, request
+from flask import Flask, g, jsonify, request
+
+
+logger = logging.getLogger("tggw")
+
+
+def _configure_logging() -> None:
+    root = logging.getLogger()
+    if not root.handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        )
+    logger.setLevel(logging.INFO)
 
 try:
     from dotenv import load_dotenv
@@ -91,10 +106,30 @@ def create_app(
     config: GatewayConfig | None = None,
     telegram_client: TelegramClient | None = None,
 ) -> Flask:
+    _configure_logging()
     gateway_config = config or GatewayConfig.from_env()
     client = telegram_client or TelegramClient(gateway_config)
 
     app = Flask(__name__)
+
+    @app.before_request
+    def _record_start() -> None:
+        g._start_ns = time.perf_counter_ns()
+
+    @app.after_request
+    def _log_access(response):
+        start = getattr(g, "_start_ns", None)
+        duration_ms = (time.perf_counter_ns() - start) / 1_000_000 if start else -1
+        client_ip = request.headers.get("X-Forwarded-For", request.remote_addr or "-").split(",")[0].strip()
+        logger.info(
+            "access %s %s %s -> %d %.1fms",
+            client_ip,
+            request.method,
+            request.path,
+            response.status_code,
+            duration_ms,
+        )
+        return response
 
     @app.get("/health")
     def health() -> tuple[Any, int]:
@@ -104,6 +139,9 @@ def create_app(
         try:
             telegram_result = client.send_message(_truncate(message, gateway_config.max_message_chars))
         except TelegramError as exc:
+            logger.error(
+                "telegram send failed: status=%s detail=%s", exc.status_code, exc.detail
+            )
             return (
                 jsonify(
                     {
@@ -116,9 +154,11 @@ def create_app(
                 502,
             )
         except requests.RequestException as exc:
+            logger.exception("telegram request failed: %s", exc)
             return jsonify({"ok": False, "error": "telegram_request_failed", "detail": str(exc)}), 502
 
         result = telegram_result.get("result", {})
+        logger.info("telegram message sent: id=%s", result.get("message_id"))
         return (
             jsonify(
                 {
@@ -131,21 +171,25 @@ def create_app(
 
     def post_message_handler() -> tuple[Any, int]:
         if not _is_authorized(gateway_config.api_auth_token):
+            logger.warning("unauthorized POST to %s", request.path)
             return jsonify({"ok": False, "error": "unauthorized"}), 401
 
         try:
             message = _message_from_request(gateway_config.max_message_chars)
         except ValueError as exc:
+            logger.warning("bad POST payload on %s: %s", request.path, exc)
             return jsonify({"ok": False, "error": str(exc)}), 400
 
         return send_message_response(message)
 
     def get_message_handler() -> tuple[Any, int]:
         if not _is_query_authorized(gateway_config.api_auth_token):
+            logger.warning("unauthorized GET to %s", request.path)
             return jsonify({"ok": False, "error": "unauthorized"}), 401
 
         message = _message_from_query(request.args.get("message", ""))
         if not message:
+            logger.warning("missing message query on %s", request.path)
             return jsonify({"ok": False, "error": "message query parameter is required"}), 400
 
         return send_message_response(message)
