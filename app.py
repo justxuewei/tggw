@@ -447,6 +447,16 @@ def create_app(
 
         key = _grafana_key(payload)
         text = _grafana_text(payload)
+        if _grafana_nodata(payload):
+            # Grafana renders no-data alerts with the frozen last-data summary
+            # (e.g. "down (loss 90%)") because the contact-point template can't
+            # see the no-data state at render time. The state labels ARE in the
+            # payload though, so detect it here and say what's actually wrong.
+            observer = (payload.get("commonLabels") or {}).get("observer") or "observer"
+            if payload.get("status") == "resolved":
+                text = f"🟢 Grafana Alert\nmessage: {observer} reporting again\nobserver: {observer}"
+            else:
+                text = f"🔴 Grafana Alert\nmessage: {observer} not reporting (down?)\nobserver: {observer}"
         if not key:
             return jsonify({"ok": False, "error": "could not derive an alert key from payload"}), 400
         if not text:
@@ -633,6 +643,19 @@ def _with_timeline(text: str, started: float, updated: float, max_chars: int) ->
     )
     body = _truncate(text, max(1, max_chars - len(footer) - 1))
     return f"{body}\n{footer}"
+
+
+def _grafana_nodata(payload: dict[str, Any]) -> bool:
+    # Grafana stamps these labels only on the no-data/error path, in the
+    # serialized webhook (commonLabels and/or each alert's labels) even though
+    # they aren't visible to the message template at render time.
+    sources = [payload.get("commonLabels")]
+    sources += [a.get("labels") for a in (payload.get("alerts") or []) if isinstance(a, dict)]
+    for labels in sources:
+        if isinstance(labels, dict):
+            if labels.get("grafana_state_reason") == "NoData" or labels.get("datasource_uid"):
+                return True
+    return False
 
 
 def _grafana_template(payload: dict[str, Any]) -> str | None:

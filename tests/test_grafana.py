@@ -8,6 +8,7 @@ from app import (
     TelegramError,
     _format_duration,
     _grafana_key,
+    _grafana_nodata,
     _grafana_text,
     _is_not_modified,
     _is_uneditable,
@@ -377,6 +378,53 @@ class GrafanaEndpointTest(unittest.TestCase):
         self.assertIsNone(response.get_json()["telegram_message_id"])
         self.assertIsNone(store.get("g1"))  # nothing persisted, no IntegrityError
 
+    def test_nodata_firing_replaces_frozen_summary(self):
+        client, fake, _clock, _store = self.make_client()
+
+        # Grafana sends the frozen data summary as the message, but stamps the
+        # no-data state label; tggw should say what's actually wrong.
+        resp = self.post(
+            client,
+            grafana_payload(message="devdm down (loss 90%)", grafana_state_reason="NoData"),
+        )
+
+        self.assertEqual(resp.get_json()["action"], "sent")
+        self.assertIn("devhome not reporting (down?)", fake.sent[0])
+        self.assertNotIn("loss 90%", fake.sent[0])
+
+    def test_nodata_detected_via_datasource_uid(self):
+        client, fake, _clock, _store = self.make_client()
+
+        resp = self.post(
+            client,
+            grafana_payload(message="devdm down (loss 90%)", datasource_uid="bfhw2sm4pr5z4d"),
+        )
+
+        self.assertEqual(resp.get_json()["action"], "sent")
+        self.assertIn("not reporting", fake.sent[0])
+
+    def test_nodata_resolved_says_reporting_again(self):
+        client, fake, _clock, _store = self.make_client()
+
+        # Open the no-data incident, then resolve it.
+        self.post(client, grafana_payload(message="x", grafana_state_reason="NoData"))
+        resolved = self.post(
+            client,
+            grafana_payload(status="resolved", message="devdm recovered", grafana_state_reason="NoData"),
+        )
+
+        self.assertEqual(resolved.get_json()["action"], "resolved")
+        self.assertIn("devhome reporting again", fake.sent[-1])
+
+    def test_data_alert_keeps_grafana_summary(self):
+        client, fake, _clock, _store = self.make_client()
+
+        # No no-data label -> trust Grafana's rendered loss text.
+        self.post(client, grafana_payload(message="devdm down (loss 90%)"))
+
+        self.assertIn("loss 90%", fake.sent[0])
+        self.assertNotIn("not reporting", fake.sent[0])
+
     def test_stale_records_are_swept(self):
         clock = FakeClock()
         client, _fake, _clock, store = self.make_client(clock=clock)
@@ -576,6 +624,13 @@ class HelperTest(unittest.TestCase):
         self.assertTrue(_is_uneditable({"description": "Bad Request: message can't be edited"}))
         self.assertTrue(_is_uneditable({"description": "message to edit not found"}))
         self.assertFalse(_is_uneditable({"description": "message is not modified"}))
+
+    def test_grafana_nodata_detection(self):
+        self.assertTrue(_grafana_nodata({"commonLabels": {"grafana_state_reason": "NoData"}}))
+        self.assertTrue(_grafana_nodata({"commonLabels": {"datasource_uid": "abc"}}))
+        self.assertTrue(_grafana_nodata({"alerts": [{"labels": {"datasource_uid": "abc"}}]}))
+        self.assertFalse(_grafana_nodata({"commonLabels": {"device": "devtx"}}))
+        self.assertFalse(_grafana_nodata({}))
 
     def test_strikethrough_wraps_and_escapes_html(self):
         self.assertEqual(_strikethrough_html("devdm down"), "<s>devdm down</s>")
