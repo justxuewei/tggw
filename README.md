@@ -79,7 +79,7 @@ duration: <elapsed, e.g. 45s / 12m / 1h30m>
 Telegram pushes a notification only for *new* messages; edits are silent. So the gateway sends (notifies) on the events worth a ping and edits silently for the rest:
 
 - **first firing** for a key → sends a new message (push) and records the message id on disk;
-- **follow-up firings** for the same key (escalation, changing loss) → silently edit that message (no-op if the text is unchanged), so repeats don't flood;
+- **follow-up firings** for the same key (escalation, changing loss) → silently edit that message in place, so repeats never add a new message (the `updated`/`duration` lines advance on each, so a repeat is a real but silent edit);
 - **resolved** → strikes through the firing bubble (a silent `HTML` edit, so it reads as no longer active) and sends a fresh message (push), then retires the record, since a silent edit alone would let the recovery slip by unnoticed;
 - if the original can no longer be edited (older than Telegram's ~48h limit, or deleted) → falls back to sending a new message.
 
@@ -158,6 +158,7 @@ make push IMAGE=xavierniu/tggw TAG=v1.0.0
 | `RECORD_DB_PATH` | `tggw-records.db` | SQLite file mapping alert keys to Telegram message ids. Mount a volume in Docker. |
 | `RECORD_TTL_HOURS` | `24` | Drop alert records untouched for this many hours. |
 | `EDIT_WINDOW_HOURS` | `47` | Send a fresh message instead of editing once the original is older than this. |
+| `TZ` | `UTC` | Timezone for the `started`/`updated` timestamps. The image ships `tzdata`. |
 | `PORT` | `8080` | Local Flask dev server port. Gunicorn in Docker listens on `8080`. |
 | `DOMAIN` | required for Compose TLS | Public hostname used by Caddy for HTTPS. |
 | `TELEGRAM_PARSE_MODE` | empty | Optional Telegram parse mode, for example `HTML` or `MarkdownV2`. |

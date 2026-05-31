@@ -9,3 +9,8 @@ __pycache__/
 venv/
 dist/
 build/
+
+# Local SQLite record store — never bake alert ids/text into the image.
+*.db
+*.db-wal
+*.db-shm

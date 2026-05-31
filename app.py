@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hmac
+import html
 import json
 import logging
 import os
@@ -89,11 +90,23 @@ class GatewayConfig:
         )
 
 
+# Sentinel for "use the configured TELEGRAM_PARSE_MODE". Passing parse_mode=None
+# explicitly forces a plain-text message regardless of the global setting, which
+# the Grafana path relies on so its already-rendered text is never reinterpreted
+# as HTML/Markdown (and only the strikethrough opts into HTML, with escaping).
+_USE_GLOBAL_PARSE_MODE = object()
+
+
 class TelegramClient:
     def __init__(self, config: GatewayConfig) -> None:
         self._config = config
 
-    def send_message(self, text: str, reply_to_message_id: int | None = None) -> dict[str, Any]:
+    def send_message(
+        self,
+        text: str,
+        reply_to_message_id: int | None = None,
+        parse_mode: str | None | object = _USE_GLOBAL_PARSE_MODE,
+    ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "chat_id": self._config.telegram_chat_id,
             "text": text,
@@ -104,23 +117,31 @@ class TelegramClient:
                 "message_id": reply_to_message_id,
                 "allow_sending_without_reply": True,
             }
+        self._apply_parse_mode(payload, parse_mode)
         return self._call("sendMessage", payload)
 
-    def edit_message(self, message_id: int, text: str, parse_mode: str | None = None) -> dict[str, Any]:
+    def edit_message(
+        self,
+        message_id: int,
+        text: str,
+        parse_mode: str | None | object = _USE_GLOBAL_PARSE_MODE,
+    ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "chat_id": self._config.telegram_chat_id,
             "message_id": message_id,
             "text": text,
         }
-        if parse_mode is not None:
-            payload["parse_mode"] = parse_mode
+        self._apply_parse_mode(payload, parse_mode)
         return self._call("editMessageText", payload)
+
+    def _apply_parse_mode(self, payload: dict[str, Any], parse_mode: str | None | object) -> None:
+        if parse_mode is _USE_GLOBAL_PARSE_MODE:
+            parse_mode = self._config.telegram_parse_mode
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
 
     def _call(self, method: str, payload: dict[str, Any]) -> dict[str, Any]:
         url = f"{self._config.telegram_api_base}/bot{self._config.telegram_bot_token}/{method}"
-        if self._config.telegram_parse_mode and "parse_mode" not in payload:
-            payload = {**payload, "parse_mode": self._config.telegram_parse_mode}
-
         response = requests.post(url, json=payload, timeout=self._config.telegram_timeout_seconds)
         try:
             body = response.json()
@@ -262,35 +283,15 @@ def create_app(
         try:
             telegram_result = client.send_message(_truncate(message, gateway_config.max_message_chars))
         except TelegramError as exc:
-            logger.error(
-                "telegram send failed: status=%s detail=%s", exc.status_code, exc.detail
-            )
-            return (
-                jsonify(
-                    {
-                        "ok": False,
-                        "error": "telegram_send_failed",
-                        "telegram_status": exc.status_code,
-                        "telegram_detail": exc.detail,
-                    }
-                ),
-                502,
-            )
+            logger.error("telegram send failed: status=%s detail=%s", exc.status_code, exc.detail)
+            return _telegram_error_response("telegram_send_failed", exc)
         except requests.RequestException as exc:
             logger.exception("telegram request failed: %s", exc)
-            return jsonify({"ok": False, "error": "telegram_request_failed", "detail": str(exc)}), 502
+            return _telegram_request_error_response(exc)
 
-        result = telegram_result.get("result", {})
-        logger.info("telegram message sent: id=%s", result.get("message_id"))
-        return (
-            jsonify(
-                {
-                    "ok": True,
-                    "telegram_message_id": result.get("message_id"),
-                }
-            ),
-            202,
-        )
+        message_id = _message_id(telegram_result)
+        logger.info("telegram message sent: id=%s", message_id)
+        return jsonify({"ok": True, "telegram_message_id": message_id}), 202
 
     def post_message_handler() -> tuple[Any, int]:
         if not _is_authorized(gateway_config.api_auth_token):
@@ -335,20 +336,10 @@ def create_app(
                 logger.info("telegram message %s unchanged", message_id)
                 return jsonify({"ok": True, "telegram_message_id": message_id, "action": "unchanged"}), 200
             logger.error("telegram edit failed: status=%s detail=%s", exc.status_code, exc.detail)
-            return (
-                jsonify(
-                    {
-                        "ok": False,
-                        "error": "telegram_edit_failed",
-                        "telegram_status": exc.status_code,
-                        "telegram_detail": exc.detail,
-                    }
-                ),
-                502,
-            )
+            return _telegram_error_response("telegram_edit_failed", exc)
         except requests.RequestException as exc:
             logger.exception("telegram request failed: %s", exc)
-            return jsonify({"ok": False, "error": "telegram_request_failed", "detail": str(exc)}), 502
+            return _telegram_request_error_response(exc)
 
         logger.info("telegram message edited: id=%s", message_id)
         return jsonify({"ok": True, "telegram_message_id": message_id, "action": "edited"}), 200
@@ -366,6 +357,9 @@ def create_app(
         """
         moment = now()
         max_chars = gateway_config.max_message_chars
+        # Grafana text is already rendered, so force plain (parse_mode=None) and
+        # keep it immune to a global TELEGRAM_PARSE_MODE; only the strikethrough
+        # opts into HTML, and it escapes its content.
         if resolved:
             record = store.get(key)
             # Reply to the firing message so the recovery quotes it (tap-to-jump),
@@ -373,27 +367,29 @@ def create_app(
             # (e.g. private chats). Replying has no time limit, unlike editing.
             reply_to = record.message_id if record is not None else None
             started = record.sent_at if record is not None else moment
-            rendered = _truncate(_with_timeline(text, started, moment), max_chars)
+            rendered = _with_timeline(text, started, moment, max_chars)
+            # Send the recovery first: it's the notification that matters. If it
+            # raises we return 502 without having struck the firing bubble or
+            # dropped the record, so Grafana's retry finds consistent state
+            # (rather than a struck "inactive" bubble with no recovery sent).
+            result = client.send_message(rendered, reply_to_message_id=reply_to, parse_mode=None)
             if record is not None and (moment - record.sent_at) <= gateway_config.edit_window_seconds:
-                # Best effort: strike the firing bubble so it reads as no longer
-                # active. The recovery push below is what must not fail.
+                # Best effort: strike the firing bubble so it reads as no longer active.
                 try:
                     client.edit_message(
                         record.message_id, _strikethrough_html(record.text), parse_mode="HTML"
                     )
                 except (TelegramError, requests.RequestException) as exc:
                     logger.warning("could not strike firing message %s: %s", record.message_id, exc)
-            result = client.send_message(rendered, reply_to_message_id=reply_to)
-            message_id = result.get("result", {}).get("message_id")
             store.delete(key)
-            return message_id, "resolved"
+            return _message_id(result), "resolved"
 
         record = store.get(key)
         if record is not None and (moment - record.sent_at) <= gateway_config.edit_window_seconds:
             # started stays anchored to the original send; duration ticks up.
-            rendered = _truncate(_with_timeline(text, record.sent_at, moment), max_chars)
+            rendered = _with_timeline(text, record.sent_at, moment, max_chars)
             try:
-                client.edit_message(record.message_id, rendered)
+                client.edit_message(record.message_id, rendered, parse_mode=None)
                 store.touch(key, moment, rendered)
                 return record.message_id, "edited"
             except TelegramError as exc:
@@ -408,10 +404,15 @@ def create_app(
                     _error_description(exc.detail),
                 )
 
-        rendered = _truncate(_with_timeline(text, moment, moment), max_chars)
-        result = client.send_message(rendered)
-        message_id = result.get("result", {}).get("message_id")
-        store.save(key, message_id, rendered, moment, moment)
+        rendered = _with_timeline(text, moment, moment, max_chars)
+        result = client.send_message(rendered, parse_mode=None)
+        message_id = _message_id(result)
+        if message_id is None:
+            # ok=true but no id (malformed/proxied response): don't persist a
+            # null record; the next alert will simply send fresh.
+            logger.warning("telegram send for key=%s returned no message_id; not recording", key)
+        else:
+            store.save(key, message_id, rendered, moment, moment)
         return message_id, "sent"
 
     def grafana_handler() -> tuple[Any, int]:
@@ -445,7 +446,7 @@ def create_app(
         store.sweep(now() - gateway_config.record_ttl_seconds)
 
         key = _grafana_key(payload)
-        text = _grafana_text(payload, gateway_config.max_message_chars)
+        text = _grafana_text(payload)
         if not key:
             return jsonify({"ok": False, "error": "could not derive an alert key from payload"}), 400
         if not text:
@@ -456,20 +457,10 @@ def create_app(
             message_id, action = dispatch_grafana(key, text, resolved)
         except TelegramError as exc:
             logger.error("telegram grafana failed: status=%s detail=%s", exc.status_code, exc.detail)
-            return (
-                jsonify(
-                    {
-                        "ok": False,
-                        "error": "telegram_send_failed",
-                        "telegram_status": exc.status_code,
-                        "telegram_detail": exc.detail,
-                    }
-                ),
-                502,
-            )
+            return _telegram_error_response("telegram_send_failed", exc)
         except requests.RequestException as exc:
             logger.exception("telegram request failed: %s", exc)
-            return jsonify({"ok": False, "error": "telegram_request_failed", "detail": str(exc)}), 502
+            return _telegram_request_error_response(exc)
 
         logger.info("grafana alert %s: key=%s id=%s", action, key, message_id)
         return (
@@ -488,6 +479,29 @@ def create_app(
         app.add_url_rule(gateway_config.webhook_path, "get_webhook_message", get_message_handler, methods=["GET"])
 
     return app
+
+
+def _message_id(result: dict[str, Any]) -> int | None:
+    inner = result.get("result")
+    return inner.get("message_id") if isinstance(inner, dict) else None
+
+
+def _telegram_error_response(error_code: str, exc: "TelegramError") -> tuple[Any, int]:
+    return (
+        jsonify(
+            {
+                "ok": False,
+                "error": error_code,
+                "telegram_status": exc.status_code,
+                "telegram_detail": exc.detail,
+            }
+        ),
+        502,
+    )
+
+
+def _telegram_request_error_response(exc: Exception) -> tuple[Any, int]:
+    return jsonify({"ok": False, "error": "telegram_request_failed", "detail": str(exc)}), 502
 
 
 def _is_authorized(expected_token: str) -> bool:
@@ -587,12 +601,11 @@ def _is_uneditable(detail: Any) -> bool:
 
 
 def _strikethrough_html(text: str) -> str:
-    escaped = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    return f"<s>{escaped}</s>"
+    return f"<s>{html.escape(text, quote=False)}</s>"
 
 
 def _format_time(epoch: float) -> str:
-    # Local time, honouring the container's TZ (Asia/Shanghai in production).
+    # Local time, honouring the container's TZ (set via the TZ env var).
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(epoch))
 
 
@@ -610,13 +623,16 @@ def _format_duration(seconds: float) -> str:
     return f"{days}d{hours}h{minutes}m"
 
 
-def _with_timeline(text: str, started: float, updated: float) -> str:
-    return (
-        f"{text}\n"
+def _with_timeline(text: str, started: float, updated: float, max_chars: int) -> str:
+    # Build the footer first and truncate only the body, so the timeline this
+    # feature exists to show always survives — never the part that gets chopped.
+    footer = (
         f"started: {_format_time(started)}\n"
         f"updated: {_format_time(updated)}\n"
         f"duration: {_format_duration(updated - started)}"
     )
+    body = _truncate(text, max(1, max_chars - len(footer) - 1))
+    return f"{body}\n{footer}"
 
 
 def _grafana_template(payload: dict[str, Any]) -> str | None:
@@ -654,11 +670,13 @@ def _grafana_key(payload: dict[str, Any]) -> str | None:
     return None
 
 
-def _grafana_text(payload: dict[str, Any], max_chars: int) -> str:
+def _grafana_text(payload: dict[str, Any]) -> str:
+    # Returned untruncated; _with_timeline truncates the body once, with room
+    # reserved for the appended timeline footer.
     for key in ("message", "title"):
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
-            return _truncate(value.strip(), max_chars)
+            return value.strip()
     return ""
 
 

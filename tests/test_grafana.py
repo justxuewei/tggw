@@ -31,27 +31,34 @@ class FakeTelegramClient:
     "message is not modified" error, so the no-op path is exercised honestly.
     """
 
+    _USE_GLOBAL = object()
+
     def __init__(self) -> None:
         self.sent: list[str] = []
         self.sent_reply_to: list[int | None] = []
+        self.sent_parse_modes: list = []
         self.edited: list[tuple[int, str]] = []
-        self.edit_parse_modes: list[str | None] = []
+        self.edit_parse_modes: list = []
         self.send_error: Exception | None = None
         self.edit_error: Exception | None = None
+        self.send_result: dict | None = None
         self._next_id = 100
         self._current: dict[int, str] = {}
 
-    def send_message(self, text: str, reply_to_message_id: int | None = None) -> dict:
+    def send_message(self, text, reply_to_message_id=None, parse_mode=_USE_GLOBAL) -> dict:
         if self.send_error is not None:
             raise self.send_error
         self.sent.append(text)
         self.sent_reply_to.append(reply_to_message_id)
+        self.sent_parse_modes.append(parse_mode)
+        if self.send_result is not None:
+            return self.send_result
         message_id = self._next_id
         self._next_id += 1
         self._current[message_id] = text
         return {"ok": True, "result": {"message_id": message_id}}
 
-    def edit_message(self, message_id: int, text: str, parse_mode: str | None = None) -> dict:
+    def edit_message(self, message_id, text, parse_mode=_USE_GLOBAL) -> dict:
         self.edited.append((message_id, text))
         self.edit_parse_modes.append(parse_mode)
         if self.edit_error is not None:
@@ -258,6 +265,19 @@ class GrafanaEndpointTest(unittest.TestCase):
         self.assertIn("devdm recovered", fake.sent[1])
         self.assertIsNone(store.get("g1"))
 
+    def test_failed_recovery_leaves_firing_unstruck_and_record_intact(self):
+        client, fake, _clock, store = self.make_client()
+
+        self.post(client, grafana_payload(status="firing", message="devdm down"))
+        fake.send_error = TelegramError(429, {"ok": False, "description": "Too Many Requests"})
+        resolved = self.post(client, grafana_payload(status="resolved", message="devdm recovered"))
+
+        # Recovery send failed: don't strike the bubble or drop the record, so a
+        # Grafana retry finds consistent state instead of a struck-but-unresolved bubble.
+        self.assertEqual(resolved.status_code, 502)
+        self.assertEqual(fake.edited, [])           # firing bubble untouched
+        self.assertIsNotNone(store.get("g1"))       # record retained for retry
+
     def test_escalation_edits_silently(self):
         client, fake, _clock, _store = self.make_client()
 
@@ -300,6 +320,62 @@ class GrafanaEndpointTest(unittest.TestCase):
         self.assertIn("duration: 1h30m", recovery)
         self.assertIn("started:", recovery)
         self.assertIn("updated:", recovery)
+
+    def test_timeline_survives_truncation_of_long_message(self):
+        config = GatewayConfig(
+            api_auth_token="secret",
+            telegram_bot_token="bot-token",
+            telegram_chat_id="@channel",
+            record_db_path=":memory:",
+            max_message_chars=120,
+        )
+        fake = FakeTelegramClient()
+        app = create_app(config, fake, RecordStore(":memory:"), FakeClock())
+        client = app.test_client()
+
+        client.post(
+            "/api/grafana",
+            headers={"Authorization": "Bearer secret"},
+            json=grafana_payload(message="x" * 500),
+        )
+
+        sent = fake.sent[0]
+        self.assertLessEqual(len(sent), 120)        # respects the limit
+        self.assertIn("duration: 0s", sent)         # footer NOT chopped off
+        self.assertIn("started:", sent)
+        self.assertIn("updated:", sent)
+
+    def test_grafana_sends_plain_regardless_of_global_parse_mode(self):
+        config = GatewayConfig(
+            api_auth_token="secret",
+            telegram_bot_token="bot-token",
+            telegram_chat_id="@channel",
+            record_db_path=":memory:",
+            telegram_parse_mode="HTML",  # global HTML must NOT leak onto alert text
+        )
+        fake = FakeTelegramClient()
+        app = create_app(config, fake, RecordStore(":memory:"), FakeClock())
+        client = app.test_client()
+
+        client.post(
+            "/api/grafana",
+            headers={"Authorization": "Bearer secret"},
+            json=grafana_payload(message="loss < 5% & rising"),
+        )
+
+        # Forced plain so '<' and '&' aren't parsed as HTML entities and 502.
+        self.assertEqual(fake.sent_parse_modes, [None])
+
+    def test_send_without_message_id_does_not_crash_or_record(self):
+        client, fake, _clock, store = self.make_client()
+        fake.send_result = {"ok": True, "result": {}}  # ok but no message_id
+
+        response = self.post(client, grafana_payload(message="devdm down"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["action"], "sent")
+        self.assertIsNone(response.get_json()["telegram_message_id"])
+        self.assertIsNone(store.get("g1"))  # nothing persisted, no IntegrityError
 
     def test_stale_records_are_swept(self):
         clock = FakeClock()
@@ -488,9 +564,9 @@ class HelperTest(unittest.TestCase):
         self.assertIsNone(_grafana_key({"status": "firing"}))
 
     def test_text_prefers_message_then_title(self):
-        self.assertEqual(_grafana_text({"message": "m", "title": "t"}, 100), "m")
-        self.assertEqual(_grafana_text({"title": "t"}, 100), "t")
-        self.assertEqual(_grafana_text({}, 100), "")
+        self.assertEqual(_grafana_text({"message": "m", "title": "t"}), "m")
+        self.assertEqual(_grafana_text({"title": "t"}), "t")
+        self.assertEqual(_grafana_text({}), "")
 
     def test_not_modified_detection(self):
         self.assertTrue(_is_not_modified({"description": "Bad Request: message is not modified"}))

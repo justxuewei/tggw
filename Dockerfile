@@ -6,6 +6,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /opt/tggw
 
+# tzdata so a non-UTC TZ (e.g. Asia/Shanghai) actually applies to the
+# started/updated timestamps; slim images ship without it and fall back to UTC.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
