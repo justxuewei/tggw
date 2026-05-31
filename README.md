@@ -80,8 +80,9 @@ Telegram pushes a notification only for *new* messages; edits are silent. So the
 
 - **first firing** for a key → sends a new message (push) and records the message id on disk;
 - **follow-up firings** for the same key (escalation, changing loss) → silently edit that message in place, so repeats never add a new message (the `updated`/`duration` lines advance on each, so a repeat is a real but silent edit);
+- **every `ROLLOVER_HOURS`** (default 24) that an incident keeps firing → strikes the current bubble and pushes a fresh message that **replies** to it, then keeps editing the new one. This gives a once-a-day heartbeat ping and a tidy chain instead of one ever-edited message, and keeps each bubble well under Telegram's ~48h edit limit. The `duration` carries over (it shows total incident time, not per-message);
 - **resolved** → strikes through the firing bubble (a silent `HTML` edit, so it reads as no longer active) and sends a fresh message (push), then retires the record, since a silent edit alone would let the recovery slip by unnoticed;
-- if the original can no longer be edited (older than Telegram's ~48h limit, or deleted) → falls back to sending a new message.
+- if a message can no longer be edited (deleted, or past the edit limit) → rolls over to a fresh one the same way.
 
 Point a Grafana webhook contact point at this path with `httpMethod: POST` and a `Bearer` token. Records untouched for `RECORD_TTL_HOURS` (default 24) are swept automatically.
 
@@ -157,7 +158,8 @@ make push IMAGE=xavierniu/tggw TAG=v1.0.0
 | `GRAFANA_TEMPLATE` | `vps-network-monitoring` | Only this template is served; requests for others are rejected. |
 | `RECORD_DB_PATH` | `tggw-records.db` | SQLite file mapping alert keys to Telegram message ids. Mount a volume in Docker. |
 | `RECORD_TTL_HOURS` | `24` | Drop alert records untouched for this many hours. |
-| `EDIT_WINDOW_HOURS` | `47` | Send a fresh message instead of editing once the original is older than this. |
+| `EDIT_WINDOW_HOURS` | `47` | Hard cap (under Telegram's 48h): roll over no later than this even if `ROLLOVER_HOURS` is larger. |
+| `ROLLOVER_HOURS` | `24` | For a long incident, strike + push a fresh replying message this often (a daily heartbeat). |
 | `TZ` | `UTC` | Timezone for the `started`/`updated` timestamps. The image ships `tzdata`. |
 | `PORT` | `8080` | Local Flask dev server port. Gunicorn in Docker listens on `8080`. |
 | `DOMAIN` | required for Compose TLS | Public hostname used by Caddy for HTTPS. |

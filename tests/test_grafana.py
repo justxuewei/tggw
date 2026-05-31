@@ -174,33 +174,60 @@ class GrafanaEndpointTest(unittest.TestCase):
         self.assertEqual(len(fake.edited), 1)
         self.assertEqual(fake.edited[0][0], 100)
 
-    def test_uneditable_message_falls_back_to_send(self):
+    def test_uneditable_message_rolls_over(self):
         client, fake, _clock, store = self.make_client()
 
         self.post(client, grafana_payload(message="devdm down"))
         fake.edit_error = uneditable_error()
         response = self.post(client, grafana_payload(message="devdm still down"))
 
+        # An uneditable message rolls over to a fresh one (replying to the old).
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.get_json()["action"], "sent")
+        self.assertEqual(response.get_json()["action"], "rolled")
         self.assertEqual(response.get_json()["telegram_message_id"], 101)
         self.assertEqual(len(fake.sent), 2)
         self.assertIn("devdm still down", fake.sent[1])
+        self.assertEqual(fake.sent_reply_to[-1], 100)  # replies to the old bubble
         self.assertEqual(store.get("g1").message_id, 101)
 
-    def test_expired_edit_window_sends_new(self):
+    def test_rollover_after_24h(self):
         clock = FakeClock()
         client, fake, _clock, store = self.make_client(clock=clock)
 
-        self.post(client, grafana_payload(message="devdm down"))
-        clock.advance(48 * 60 * 60)
-        response = self.post(client, grafana_payload(message="devdm down again"))
+        self.post(client, grafana_payload(message="devdm down"))   # id 100, started=now
+        # A real firing alert repeats every few minutes, keeping the record fresh
+        # (so the 24h TTL never sweeps it); only sent_at ages toward the rollover.
+        clock.advance(12 * 60 * 60)
+        self.post(client, grafana_payload(message="devdm down"))   # edit, refreshes last_update
+        clock.advance(13 * 60 * 60)                                # 25h since first send
+        response = self.post(client, grafana_payload(message="devdm still down"))
 
-        self.assertEqual(response.get_json()["action"], "sent")
-        self.assertEqual(fake.edited, [])  # never attempted an edit past the window
-        self.assertEqual(len(fake.sent), 2)
-        self.assertIn("devdm down again", fake.sent[1])
-        self.assertEqual(store.get("g1").message_id, 101)
+        # Rolled over: struck the old bubble, pushed a NEW one replying to it.
+        self.assertEqual(response.get_json()["action"], "rolled")
+        self.assertEqual(response.get_json()["telegram_message_id"], 101)
+        self.assertEqual(len(fake.sent), 2)                        # a real new push
+        self.assertIn("devdm still down", fake.sent[1])
+        self.assertEqual(fake.sent_reply_to[-1], 100)              # replies to the old
+        # old bubble struck through (HTML edit)
+        self.assertEqual(fake.edited[-1][0], 100)
+        self.assertTrue(fake.edited[-1][1].startswith("<s>"))
+        self.assertEqual(fake.edit_parse_modes[-1], "HTML")
+        # record now points at the new message; started preserved, so duration is cumulative
+        record = store.get("g1")
+        self.assertEqual(record.message_id, 101)
+        self.assertIn("duration: 1d1h0m", fake.sent[1])            # 25h since the true start
+
+    def test_edits_in_place_within_24h(self):
+        clock = FakeClock()
+        client, fake, _clock, _store = self.make_client(clock=clock)
+
+        self.post(client, grafana_payload(message="devdm down"))
+        clock.advance(60 * 60)  # 1h later -> still within rollover window
+        response = self.post(client, grafana_payload(message="devdm worse"))
+
+        self.assertEqual(response.get_json()["action"], "edited")
+        self.assertEqual(response.get_json()["telegram_message_id"], 100)  # same bubble
+        self.assertEqual(len(fake.sent), 1)  # no new push
 
     def test_resolved_sends_notifying_message_and_retires_record(self):
         client, fake, _clock, store = self.make_client()
@@ -430,7 +457,7 @@ class GrafanaEndpointTest(unittest.TestCase):
     def test_stale_records_are_swept(self):
         clock = FakeClock()
         client, _fake, _clock, store = self.make_client(clock=clock)
-        store.save("old", 5, "stale", clock.now, clock.now)
+        store.save("old", 5, "stale", clock.now, clock.now, clock.now)
 
         clock.advance(25 * 60 * 60)  # past the 24h TTL
         self.post(client, grafana_payload(group_key="fresh"))
@@ -551,42 +578,44 @@ class EditEndpointTest(unittest.TestCase):
 class RecordStoreTest(unittest.TestCase):
     def test_save_and_get(self):
         store = RecordStore(":memory:")
-        store.save("k", 7, "hello", 100.0, 100.0)
+        store.save("k", 7, "hello", 50.0, 100.0, 100.0)
 
         record = store.get("k")
         self.assertEqual(record.message_id, 7)
         self.assertEqual(record.text, "hello")
+        self.assertEqual(record.started, 50.0)
         self.assertEqual(record.sent_at, 100.0)
         self.assertEqual(record.last_update, 100.0)
 
     def test_save_overwrites(self):
         store = RecordStore(":memory:")
-        store.save("k", 7, "a", 100.0, 100.0)
-        store.save("k", 9, "b", 200.0, 200.0)
+        store.save("k", 7, "a", 50.0, 100.0, 100.0)
+        store.save("k", 9, "b", 50.0, 200.0, 200.0)
 
         self.assertEqual(store.get("k").message_id, 9)
 
-    def test_touch_updates_last_update_and_text_keeping_sent_at(self):
+    def test_touch_updates_last_update_and_text_keeping_started(self):
         store = RecordStore(":memory:")
-        store.save("k", 7, "old", 100.0, 100.0)
+        store.save("k", 7, "old", 50.0, 100.0, 100.0)
         store.touch("k", 250.0, "new")
 
         record = store.get("k")
-        self.assertEqual(record.sent_at, 100.0)  # unchanged: the 48h edit window anchor
+        self.assertEqual(record.started, 50.0)   # anchors the duration, unchanged
+        self.assertEqual(record.sent_at, 100.0)  # current-message/rollover anchor, unchanged
         self.assertEqual(record.last_update, 250.0)
         self.assertEqual(record.text, "new")
 
     def test_delete(self):
         store = RecordStore(":memory:")
-        store.save("k", 7, "x", 100.0, 100.0)
+        store.save("k", 7, "x", 50.0, 100.0, 100.0)
         store.delete("k")
 
         self.assertIsNone(store.get("k"))
 
     def test_sweep_removes_only_stale(self):
         store = RecordStore(":memory:")
-        store.save("old", 1, "a", 10.0, 10.0)
-        store.save("new", 2, "b", 10.0, 100.0)
+        store.save("old", 1, "a", 10.0, 10.0, 10.0)
+        store.save("new", 2, "b", 10.0, 10.0, 100.0)
 
         removed = store.sweep(older_than=50.0)
 
@@ -631,7 +660,12 @@ class HelperTest(unittest.TestCase):
         self.assertTrue(_grafana_nodata({"commonLabels": {"grafana_state_reason": "NoData"}}))
         self.assertTrue(_grafana_nodata({"commonLabels": {"datasource_uid": "abc"}}))
         self.assertTrue(_grafana_nodata({"alerts": [{"labels": {"datasource_uid": "abc"}}]}))
+        # Markers may sit outside labels (an alert field / annotations); the
+        # recursive scan finds them wherever they are.
+        self.assertTrue(_grafana_nodata({"alerts": [{"grafana_state_reason": "NoData"}]}))
+        self.assertTrue(_grafana_nodata({"alerts": [{"annotations": {"datasource_uid": "x"}}]}))
         self.assertFalse(_grafana_nodata({"commonLabels": {"device": "devtx"}}))
+        self.assertFalse(_grafana_nodata({"alerts": [{"labels": {"observer": "devtx"}}]}))
         self.assertFalse(_grafana_nodata({}))
 
     def test_strikethrough_wraps_and_escapes_html(self):

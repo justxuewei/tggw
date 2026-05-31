@@ -16,6 +16,7 @@ services:
       RECORD_DB_PATH: ${RECORD_DB_PATH:-/data/tggw-records.db}
       RECORD_TTL_HOURS: ${RECORD_TTL_HOURS:-24}
       EDIT_WINDOW_HOURS: ${EDIT_WINDOW_HOURS:-47}
+      ROLLOVER_HOURS: ${ROLLOVER_HOURS:-24}
       # Timezone for the started/updated timestamps (needs tzdata, in the image).
       TZ: ${TZ:-UTC}
     volumes:

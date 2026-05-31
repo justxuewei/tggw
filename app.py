@@ -62,6 +62,7 @@ class GatewayConfig:
     record_db_path: str = "tggw-records.db"
     record_ttl_seconds: float = 24 * 60 * 60
     edit_window_seconds: float = 47 * 60 * 60
+    rollover_seconds: float = 24 * 60 * 60
 
     @classmethod
     def from_env(cls) -> "GatewayConfig":
@@ -87,6 +88,7 @@ class GatewayConfig:
             record_db_path=os.getenv("RECORD_DB_PATH", "tggw-records.db"),
             record_ttl_seconds=_float_env("RECORD_TTL_HOURS", 24.0) * 60 * 60,
             edit_window_seconds=_float_env("EDIT_WINDOW_HOURS", 47.0) * 60 * 60,
+            rollover_seconds=_float_env("ROLLOVER_HOURS", 24.0) * 60 * 60,
         )
 
 
@@ -159,7 +161,8 @@ class MessageRecord:
     key: str
     message_id: int
     text: str
-    sent_at: float
+    started: float      # true incident start, preserved across daily rollovers
+    sent_at: float      # when the *current* message was sent (rollover/edit-window anchor)
     last_update: float
 
 
@@ -184,16 +187,21 @@ class RecordStore:
                 " sent_at REAL NOT NULL,"
                 " last_update REAL NOT NULL)"
             )
-            # Migrate tables created before the text column existed.
+            # Migrate tables created before the text/started columns existed.
             columns = {row[1] for row in self._conn.execute("PRAGMA table_info(messages)")}
             if "text" not in columns:
                 self._conn.execute("ALTER TABLE messages ADD COLUMN text TEXT NOT NULL DEFAULT ''")
+            if "started" not in columns:
+                self._conn.execute("ALTER TABLE messages ADD COLUMN started REAL NOT NULL DEFAULT 0")
+                # Pre-rollover rows: seed started from sent_at (their original send).
+                self._conn.execute("UPDATE messages SET started = sent_at WHERE started = 0")
             self._conn.commit()
 
     def get(self, key: str) -> MessageRecord | None:
         with self._lock:
             row = self._conn.execute(
-                "SELECT key, message_id, text, sent_at, last_update FROM messages WHERE key = ?",
+                "SELECT key, message_id, text, started, sent_at, last_update"
+                " FROM messages WHERE key = ?",
                 (key,),
             ).fetchone()
         if row is None:
@@ -202,21 +210,31 @@ class RecordStore:
             key=row["key"],
             message_id=row["message_id"],
             text=row["text"],
+            started=row["started"],
             sent_at=row["sent_at"],
             last_update=row["last_update"],
         )
 
-    def save(self, key: str, message_id: int, text: str, sent_at: float, last_update: float) -> None:
+    def save(
+        self,
+        key: str,
+        message_id: int,
+        text: str,
+        started: float,
+        sent_at: float,
+        last_update: float,
+    ) -> None:
         with self._lock:
             self._conn.execute(
-                "INSERT INTO messages (key, message_id, text, sent_at, last_update)"
-                " VALUES (?, ?, ?, ?, ?)"
+                "INSERT INTO messages (key, message_id, text, started, sent_at, last_update)"
+                " VALUES (?, ?, ?, ?, ?, ?)"
                 " ON CONFLICT(key) DO UPDATE SET"
                 " message_id = excluded.message_id,"
                 " text = excluded.text,"
+                " started = excluded.started,"
                 " sent_at = excluded.sent_at,"
                 " last_update = excluded.last_update",
-                (key, message_id, text, sent_at, last_update),
+                (key, message_id, text, started, sent_at, last_update),
             )
             self._conn.commit()
 
@@ -366,7 +384,7 @@ def create_app(
             # which also references the original where message links don't exist
             # (e.g. private chats). Replying has no time limit, unlike editing.
             reply_to = record.message_id if record is not None else None
-            started = record.sent_at if record is not None else moment
+            started = record.started if record is not None else moment
             rendered = _with_timeline(text, started, moment, max_chars)
             # Send the recovery first: it's the notification that matters. If it
             # raises we return 502 without having struck the firing bubble or
@@ -385,9 +403,12 @@ def create_app(
             return _message_id(result), "resolved"
 
         record = store.get(key)
-        if record is not None and (moment - record.sent_at) <= gateway_config.edit_window_seconds:
-            # started stays anchored to the original send; duration ticks up.
-            rendered = _with_timeline(text, record.sent_at, moment, max_chars)
+        # Edit the current bubble in place until it ages past the rollover window
+        # (also capped below Telegram's edit limit). started stays anchored to the
+        # incident start so the duration keeps climbing across rollovers.
+        rollover_after = min(gateway_config.rollover_seconds, gateway_config.edit_window_seconds)
+        if record is not None and (moment - record.sent_at) < rollover_after:
+            rendered = _with_timeline(text, record.started, moment, max_chars)
             try:
                 client.edit_message(record.message_id, rendered, parse_mode=None)
                 store.touch(key, moment, rendered)
@@ -399,21 +420,33 @@ def create_app(
                 if not _is_uneditable(exc.detail):
                     raise
                 logger.info(
-                    "telegram message %s no longer editable (%s); sending fresh",
+                    "telegram message %s no longer editable (%s); rolling over",
                     record.message_id,
                     _error_description(exc.detail),
                 )
 
-        rendered = _with_timeline(text, moment, moment, max_chars)
-        result = client.send_message(rendered, parse_mode=None)
+        # Roll over: a long-running incident has outlived the current bubble (or
+        # it became uneditable). Strike the old message, then push a NEW one that
+        # replies to it, so the chat shows a daily chain and pings once a day.
+        started = record.started if record is not None else moment
+        reply_to = record.message_id if record is not None else None
+        if record is not None:
+            try:
+                client.edit_message(
+                    record.message_id, _strikethrough_html(record.text), parse_mode="HTML"
+                )
+            except (TelegramError, requests.RequestException) as exc:
+                logger.warning("could not strike rolled-over message %s: %s", record.message_id, exc)
+        rendered = _with_timeline(text, started, moment, max_chars)
+        result = client.send_message(rendered, reply_to_message_id=reply_to, parse_mode=None)
         message_id = _message_id(result)
         if message_id is None:
             # ok=true but no id (malformed/proxied response): don't persist a
             # null record; the next alert will simply send fresh.
             logger.warning("telegram send for key=%s returned no message_id; not recording", key)
         else:
-            store.save(key, message_id, rendered, moment, moment)
-        return message_id, "sent"
+            store.save(key, message_id, rendered, started, moment, moment)
+        return message_id, ("rolled" if record is not None else "sent")
 
     def grafana_handler() -> tuple[Any, int]:
         if not _is_authorized(gateway_config.api_auth_token):
@@ -644,16 +677,20 @@ def _with_timeline(text: str, started: float, updated: float, max_chars: int) ->
 
 
 def _grafana_nodata(payload: dict[str, Any]) -> bool:
-    # Grafana stamps these labels only on the no-data/error path, in the
-    # serialized webhook (commonLabels and/or each alert's labels) even though
-    # they aren't visible to the message template at render time.
-    sources = [payload.get("commonLabels")]
-    sources += [a.get("labels") for a in (payload.get("alerts") or []) if isinstance(a, dict)]
-    for labels in sources:
-        if isinstance(labels, dict):
-            if labels.get("grafana_state_reason") == "NoData" or labels.get("datasource_uid"):
+    # Grafana marks no-data alerts with grafana_state_reason="NoData" (plus
+    # datasource_uid/ref_id), but NOT inside commonLabels/labels — it places
+    # them elsewhere in the webhook. Scan the whole payload so detection doesn't
+    # depend on the exact location.
+    def has_marker(node: Any) -> bool:
+        if isinstance(node, dict):
+            if node.get("grafana_state_reason") == "NoData" or node.get("datasource_uid"):
                 return True
-    return False
+            return any(has_marker(value) for value in node.values())
+        if isinstance(node, list):
+            return any(has_marker(value) for value in node)
+        return False
+
+    return has_marker(payload)
 
 
 def _grafana_template(payload: dict[str, Any]) -> str | None:
