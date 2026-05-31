@@ -4,9 +4,11 @@ import hmac
 import json
 import logging
 import os
+import sqlite3
+import threading
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import requests
 from flask import Flask, g, jsonify, request
@@ -54,6 +56,11 @@ class GatewayConfig:
     telegram_parse_mode: str | None = None
     telegram_timeout_seconds: float = 10.0
     max_message_chars: int = 3900
+    grafana_path: str = "/api/grafana"
+    grafana_template: str = "vps-network-monitoring"
+    record_db_path: str = "tggw-records.db"
+    record_ttl_seconds: float = 24 * 60 * 60
+    edit_window_seconds: float = 47 * 60 * 60
 
     @classmethod
     def from_env(cls) -> "GatewayConfig":
@@ -74,6 +81,11 @@ class GatewayConfig:
             telegram_parse_mode=_optional_env("TELEGRAM_PARSE_MODE"),
             telegram_timeout_seconds=_float_env("TELEGRAM_TIMEOUT_SECONDS", 10.0),
             max_message_chars=max_message_chars,
+            grafana_path=_normalize_path(os.getenv("GRAFANA_PATH", "/api/grafana")),
+            grafana_template=os.getenv("GRAFANA_TEMPLATE", "vps-network-monitoring"),
+            record_db_path=os.getenv("RECORD_DB_PATH", "tggw-records.db"),
+            record_ttl_seconds=_float_env("RECORD_TTL_HOURS", 24.0) * 60 * 60,
+            edit_window_seconds=_float_env("EDIT_WINDOW_HOURS", 47.0) * 60 * 60,
         )
 
 
@@ -81,14 +93,33 @@ class TelegramClient:
     def __init__(self, config: GatewayConfig) -> None:
         self._config = config
 
-    def send_message(self, text: str) -> dict[str, Any]:
-        url = f"{self._config.telegram_api_base}/bot{self._config.telegram_bot_token}/sendMessage"
+    def send_message(self, text: str, reply_to_message_id: int | None = None) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "chat_id": self._config.telegram_chat_id,
             "text": text,
         }
-        if self._config.telegram_parse_mode:
-            payload["parse_mode"] = self._config.telegram_parse_mode
+        if reply_to_message_id is not None:
+            # allow_sending_without_reply: still deliver if the original was deleted.
+            payload["reply_parameters"] = {
+                "message_id": reply_to_message_id,
+                "allow_sending_without_reply": True,
+            }
+        return self._call("sendMessage", payload)
+
+    def edit_message(self, message_id: int, text: str, parse_mode: str | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "chat_id": self._config.telegram_chat_id,
+            "message_id": message_id,
+            "text": text,
+        }
+        if parse_mode is not None:
+            payload["parse_mode"] = parse_mode
+        return self._call("editMessageText", payload)
+
+    def _call(self, method: str, payload: dict[str, Any]) -> dict[str, Any]:
+        url = f"{self._config.telegram_api_base}/bot{self._config.telegram_bot_token}/{method}"
+        if self._config.telegram_parse_mode and "parse_mode" not in payload:
+            payload = {**payload, "parse_mode": self._config.telegram_parse_mode}
 
         response = requests.post(url, json=payload, timeout=self._config.telegram_timeout_seconds)
         try:
@@ -102,13 +133,105 @@ class TelegramClient:
         return body
 
 
+@dataclass(frozen=True)
+class MessageRecord:
+    key: str
+    message_id: int
+    text: str
+    sent_at: float
+    last_update: float
+
+
+class RecordStore:
+    """Maps an alert identity to the Telegram message it owns.
+
+    A single sqlite connection guarded by a lock: enough for the gunicorn
+    single-worker deployment, and sqlite takes care of durable writes so the
+    message ids survive restarts.
+    """
+
+    def __init__(self, path: str) -> None:
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(path, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        with self._lock:
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS messages ("
+                " key TEXT PRIMARY KEY,"
+                " message_id INTEGER NOT NULL,"
+                " text TEXT NOT NULL DEFAULT '',"
+                " sent_at REAL NOT NULL,"
+                " last_update REAL NOT NULL)"
+            )
+            # Migrate tables created before the text column existed.
+            columns = {row[1] for row in self._conn.execute("PRAGMA table_info(messages)")}
+            if "text" not in columns:
+                self._conn.execute("ALTER TABLE messages ADD COLUMN text TEXT NOT NULL DEFAULT ''")
+            self._conn.commit()
+
+    def get(self, key: str) -> MessageRecord | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT key, message_id, text, sent_at, last_update FROM messages WHERE key = ?",
+                (key,),
+            ).fetchone()
+        if row is None:
+            return None
+        return MessageRecord(
+            key=row["key"],
+            message_id=row["message_id"],
+            text=row["text"],
+            sent_at=row["sent_at"],
+            last_update=row["last_update"],
+        )
+
+    def save(self, key: str, message_id: int, text: str, sent_at: float, last_update: float) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO messages (key, message_id, text, sent_at, last_update)"
+                " VALUES (?, ?, ?, ?, ?)"
+                " ON CONFLICT(key) DO UPDATE SET"
+                " message_id = excluded.message_id,"
+                " text = excluded.text,"
+                " sent_at = excluded.sent_at,"
+                " last_update = excluded.last_update",
+                (key, message_id, text, sent_at, last_update),
+            )
+            self._conn.commit()
+
+    def touch(self, key: str, last_update: float, text: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE messages SET last_update = ?, text = ? WHERE key = ?",
+                (last_update, text, key),
+            )
+            self._conn.commit()
+
+    def delete(self, key: str) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM messages WHERE key = ?", (key,))
+            self._conn.commit()
+
+    def sweep(self, older_than: float) -> int:
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM messages WHERE last_update < ?", (older_than,)
+            )
+            self._conn.commit()
+            return cursor.rowcount
+
+
 def create_app(
     config: GatewayConfig | None = None,
     telegram_client: TelegramClient | None = None,
+    record_store: RecordStore | None = None,
+    clock: Callable[[], float] | None = None,
 ) -> Flask:
     _configure_logging()
     gateway_config = config or GatewayConfig.from_env()
     client = telegram_client or TelegramClient(gateway_config)
+    store = record_store or RecordStore(gateway_config.record_db_path)
+    now = clock or time.time
 
     app = Flask(__name__)
 
@@ -194,8 +317,172 @@ def create_app(
 
         return send_message_response(message)
 
+    def patch_message_handler(message_id: int) -> tuple[Any, int]:
+        if not _is_authorized(gateway_config.api_auth_token):
+            logger.warning("unauthorized PATCH to %s", request.path)
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+        try:
+            message = _message_from_request(gateway_config.max_message_chars)
+        except ValueError as exc:
+            logger.warning("bad PATCH payload on %s: %s", request.path, exc)
+            return jsonify({"ok": False, "error": str(exc)}), 400
+
+        try:
+            client.edit_message(message_id, message)
+        except TelegramError as exc:
+            if _is_not_modified(exc.detail):
+                logger.info("telegram message %s unchanged", message_id)
+                return jsonify({"ok": True, "telegram_message_id": message_id, "action": "unchanged"}), 200
+            logger.error("telegram edit failed: status=%s detail=%s", exc.status_code, exc.detail)
+            return (
+                jsonify(
+                    {
+                        "ok": False,
+                        "error": "telegram_edit_failed",
+                        "telegram_status": exc.status_code,
+                        "telegram_detail": exc.detail,
+                    }
+                ),
+                502,
+            )
+        except requests.RequestException as exc:
+            logger.exception("telegram request failed: %s", exc)
+            return jsonify({"ok": False, "error": "telegram_request_failed", "detail": str(exc)}), 502
+
+        logger.info("telegram message edited: id=%s", message_id)
+        return jsonify({"ok": True, "telegram_message_id": message_id, "action": "edited"}), 200
+
+    def dispatch_grafana(key: str, text: str, resolved: bool) -> tuple[int, str]:
+        """Pick send-vs-edit for an alert. Sends notify; edits are silent.
+
+        Firing: send (push) the first time we see a key, then silently edit that
+        message on follow-ups (escalation, changing loss). Resolved: always send
+        a fresh notifying message and retire the record, since a silent edit
+        would let the recovery slip by unnoticed.
+
+        Returns (message_id, action). Raises TelegramError/RequestException so the
+        caller can map transport failures to 502.
+        """
+        moment = now()
+        max_chars = gateway_config.max_message_chars
+        if resolved:
+            record = store.get(key)
+            # Reply to the firing message so the recovery quotes it (tap-to-jump),
+            # which also references the original where message links don't exist
+            # (e.g. private chats). Replying has no time limit, unlike editing.
+            reply_to = record.message_id if record is not None else None
+            started = record.sent_at if record is not None else moment
+            rendered = _truncate(_with_timeline(text, started, moment), max_chars)
+            if record is not None and (moment - record.sent_at) <= gateway_config.edit_window_seconds:
+                # Best effort: strike the firing bubble so it reads as no longer
+                # active. The recovery push below is what must not fail.
+                try:
+                    client.edit_message(
+                        record.message_id, _strikethrough_html(record.text), parse_mode="HTML"
+                    )
+                except (TelegramError, requests.RequestException) as exc:
+                    logger.warning("could not strike firing message %s: %s", record.message_id, exc)
+            result = client.send_message(rendered, reply_to_message_id=reply_to)
+            message_id = result.get("result", {}).get("message_id")
+            store.delete(key)
+            return message_id, "resolved"
+
+        record = store.get(key)
+        if record is not None and (moment - record.sent_at) <= gateway_config.edit_window_seconds:
+            # started stays anchored to the original send; duration ticks up.
+            rendered = _truncate(_with_timeline(text, record.sent_at, moment), max_chars)
+            try:
+                client.edit_message(record.message_id, rendered)
+                store.touch(key, moment, rendered)
+                return record.message_id, "edited"
+            except TelegramError as exc:
+                if _is_not_modified(exc.detail):
+                    store.touch(key, moment, rendered)
+                    return record.message_id, "unchanged"
+                if not _is_uneditable(exc.detail):
+                    raise
+                logger.info(
+                    "telegram message %s no longer editable (%s); sending fresh",
+                    record.message_id,
+                    _error_description(exc.detail),
+                )
+
+        rendered = _truncate(_with_timeline(text, moment, moment), max_chars)
+        result = client.send_message(rendered)
+        message_id = result.get("result", {}).get("message_id")
+        store.save(key, message_id, rendered, moment, moment)
+        return message_id, "sent"
+
+    def grafana_handler() -> tuple[Any, int]:
+        if not _is_authorized(gateway_config.api_auth_token):
+            logger.warning("unauthorized POST to %s", request.path)
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            logger.warning("bad grafana payload on %s", request.path)
+            return jsonify({"ok": False, "error": "json object body is required"}), 400
+
+        # This endpoint is scoped to one template, carried in the payload as the
+        # `template` (or `service`) alert label; reject anything else so
+        # misrouting is loud.
+        template = _grafana_template(payload)
+        if template != gateway_config.grafana_template:
+            logger.warning("rejected grafana template %r on %s", template, request.path)
+            return (
+                jsonify(
+                    {
+                        "ok": False,
+                        "error": "unsupported template",
+                        "template": template,
+                        "supported": gateway_config.grafana_template,
+                    }
+                ),
+                400,
+            )
+
+        store.sweep(now() - gateway_config.record_ttl_seconds)
+
+        key = _grafana_key(payload)
+        text = _grafana_text(payload, gateway_config.max_message_chars)
+        if not key:
+            return jsonify({"ok": False, "error": "could not derive an alert key from payload"}), 400
+        if not text:
+            return jsonify({"ok": False, "error": "could not derive message text from payload"}), 400
+
+        resolved = payload.get("status") == "resolved"
+        try:
+            message_id, action = dispatch_grafana(key, text, resolved)
+        except TelegramError as exc:
+            logger.error("telegram grafana failed: status=%s detail=%s", exc.status_code, exc.detail)
+            return (
+                jsonify(
+                    {
+                        "ok": False,
+                        "error": "telegram_send_failed",
+                        "telegram_status": exc.status_code,
+                        "telegram_detail": exc.detail,
+                    }
+                ),
+                502,
+            )
+        except requests.RequestException as exc:
+            logger.exception("telegram request failed: %s", exc)
+            return jsonify({"ok": False, "error": "telegram_request_failed", "detail": str(exc)}), 502
+
+        logger.info("grafana alert %s: key=%s id=%s", action, key, message_id)
+        return (
+            jsonify({"ok": True, "action": action, "telegram_message_id": message_id, "key": key}),
+            200,
+        )
+
     app.add_url_rule("/api/messages", "post_message", post_message_handler, methods=["POST"])
     app.add_url_rule("/api/messages", "get_message", get_message_handler, methods=["GET"])
+    app.add_url_rule(
+        "/api/messages/<int:message_id>", "patch_message", patch_message_handler, methods=["PATCH"]
+    )
+    app.add_url_rule(gateway_config.grafana_path, "grafana", grafana_handler, methods=["POST"])
     if gateway_config.webhook_path != "/api/messages":
         app.add_url_rule(gateway_config.webhook_path, "post_webhook_message", post_message_handler, methods=["POST"])
         app.add_url_rule(gateway_config.webhook_path, "get_webhook_message", get_message_handler, methods=["GET"])
@@ -270,6 +557,109 @@ def _message_from_payload(payload: Any) -> str:
             return title.strip()
 
     return _json_dump(payload)
+
+
+def _error_description(detail: Any) -> str:
+    if isinstance(detail, dict):
+        description = detail.get("description")
+        if isinstance(description, str):
+            return description
+    return str(detail)
+
+
+def _is_not_modified(detail: Any) -> bool:
+    return "message is not modified" in _error_description(detail).lower()
+
+
+def _is_uneditable(detail: Any) -> bool:
+    # Telegram refuses to edit a message that is too old (~48h), was deleted, or
+    # never existed. In those cases the caller should fall back to sending anew.
+    description = _error_description(detail).lower()
+    return any(
+        marker in description
+        for marker in (
+            "message can't be edited",
+            "message to edit not found",
+            "message_id_invalid",
+            "message identifier is not specified",
+        )
+    )
+
+
+def _strikethrough_html(text: str) -> str:
+    escaped = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return f"<s>{escaped}</s>"
+
+
+def _format_time(epoch: float) -> str:
+    # Local time, honouring the container's TZ (Asia/Shanghai in production).
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(epoch))
+
+
+def _format_duration(seconds: float) -> str:
+    total = max(0, int(seconds))
+    if total < 60:
+        return f"{total}s"
+    minutes = total // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h{minutes}m"
+    days, hours = divmod(hours, 24)
+    return f"{days}d{hours}h{minutes}m"
+
+
+def _with_timeline(text: str, started: float, updated: float) -> str:
+    return (
+        f"{text}\n"
+        f"started: {_format_time(started)}\n"
+        f"updated: {_format_time(updated)}\n"
+        f"duration: {_format_duration(updated - started)}"
+    )
+
+
+def _grafana_template(payload: dict[str, Any]) -> str | None:
+    # Carried in the JSON payload as an alert label (Grafana surfaces labels under
+    # commonLabels). Prefer a dedicated `template` label, else the `service` label.
+    labels = payload.get("commonLabels")
+    if isinstance(labels, dict):
+        for label in ("template", "service"):
+            value = labels.get(label)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def _grafana_key(payload: dict[str, Any]) -> str | None:
+    # groupKey identifies the notification stream that maps 1:1 to a rendered
+    # message; fall back to the observer/device labels, then a fingerprint.
+    group_key = payload.get("groupKey")
+    if isinstance(group_key, str) and group_key.strip():
+        return group_key.strip()
+
+    labels = payload.get("commonLabels")
+    if isinstance(labels, dict):
+        observer = labels.get("observer")
+        device = labels.get("device")
+        if observer and device:
+            return f"{observer}->{device}"
+
+    alerts = payload.get("alerts")
+    if isinstance(alerts, list) and alerts and isinstance(alerts[0], dict):
+        fingerprint = alerts[0].get("fingerprint")
+        if fingerprint:
+            return str(fingerprint)
+
+    return None
+
+
+def _grafana_text(payload: dict[str, Any], max_chars: int) -> str:
+    for key in ("message", "title"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return _truncate(value.strip(), max_chars)
+    return ""
 
 
 def _truncate(message: str, max_chars: int) -> str:

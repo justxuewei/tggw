@@ -8,9 +8,16 @@ services:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?set TELEGRAM_BOT_TOKEN}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:?set TELEGRAM_CHAT_ID}
       WEBHOOK_PATH: ${WEBHOOK_PATH:-/api/messages}
+      GRAFANA_PATH: ${GRAFANA_PATH:-/api/grafana}
+      GRAFANA_TEMPLATE: ${GRAFANA_TEMPLATE:-vps-network-monitoring}
       TELEGRAM_PARSE_MODE: ${TELEGRAM_PARSE_MODE:-}
       TELEGRAM_TIMEOUT_SECONDS: ${TELEGRAM_TIMEOUT_SECONDS:-10}
       MAX_MESSAGE_CHARS: ${MAX_MESSAGE_CHARS:-3900}
+      RECORD_DB_PATH: ${RECORD_DB_PATH:-/data/tggw-records.db}
+      RECORD_TTL_HOURS: ${RECORD_TTL_HOURS:-24}
+      EDIT_WINDOW_HOURS: ${EDIT_WINDOW_HOURS:-47}
+    volumes:
+      - tggw_data:/data
     expose:
       - "8080"
 
@@ -32,3 +39,4 @@ services:
 volumes:
   caddy_data:
   caddy_config:
+  tggw_data:

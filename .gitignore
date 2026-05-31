@@ -37,3 +37,8 @@ htmlcov/
 # Tooling / local files
 .python-version
 *.log
+
+# Local record store
+*.db
+*.db-wal
+*.db-shm
