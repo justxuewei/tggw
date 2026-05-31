@@ -447,16 +447,14 @@ def create_app(
 
         key = _grafana_key(payload)
         text = _grafana_text(payload)
-        if _grafana_nodata(payload):
+        if _grafana_nodata(payload) and payload.get("status") != "resolved":
             # Grafana renders no-data alerts with the frozen last-data summary
             # (e.g. "down (loss 90%)") because the contact-point template can't
             # see the no-data state at render time. The state labels ARE in the
             # payload though, so detect it here and say what's actually wrong.
+            # Resolution follows the normal recovery path (no special text).
             observer = (payload.get("commonLabels") or {}).get("observer") or "observer"
-            if payload.get("status") == "resolved":
-                text = f"🟢 Grafana Alert\nmessage: {observer} reporting again\nobserver: {observer}"
-            else:
-                text = f"🔴 Grafana Alert\nmessage: {observer} not reporting (down?)\nobserver: {observer}"
+            text = f"🔴 Grafana Alert\nmessage: {observer} not reporting (down?)\nobserver: {observer}"
         if not key:
             return jsonify({"ok": False, "error": "could not derive an alert key from payload"}), 400
         if not text:

@@ -403,10 +403,11 @@ class GrafanaEndpointTest(unittest.TestCase):
         self.assertEqual(resp.get_json()["action"], "sent")
         self.assertIn("not reporting", fake.sent[0])
 
-    def test_nodata_resolved_says_reporting_again(self):
+    def test_nodata_resolved_uses_normal_recovery_text(self):
         client, fake, _clock, _store = self.make_client()
 
-        # Open the no-data incident, then resolve it.
+        # Open the no-data incident, then resolve it. Resolve is not special-cased:
+        # it follows the normal recovery path with Grafana's rendered text.
         self.post(client, grafana_payload(message="x", grafana_state_reason="NoData"))
         resolved = self.post(
             client,
@@ -414,7 +415,8 @@ class GrafanaEndpointTest(unittest.TestCase):
         )
 
         self.assertEqual(resolved.get_json()["action"], "resolved")
-        self.assertIn("devhome reporting again", fake.sent[-1])
+        self.assertIn("devdm recovered", fake.sent[-1])
+        self.assertNotIn("reporting again", fake.sent[-1])
 
     def test_data_alert_keeps_grafana_summary(self):
         client, fake, _clock, _store = self.make_client()
