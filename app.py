@@ -297,9 +297,11 @@ def create_app(
     def health() -> tuple[Any, int]:
         return jsonify({"ok": True}), 200
 
-    def send_message_response(message: str) -> tuple[Any, int]:
+    def send_message_response(message: str, parse_mode: str | None = None) -> tuple[Any, int]:
         try:
-            telegram_result = client.send_message(_truncate(message, gateway_config.max_message_chars))
+            telegram_result = client.send_message(
+                _truncate(message, gateway_config.max_message_chars), parse_mode=parse_mode
+            )
         except TelegramError as exc:
             logger.error("telegram send failed: status=%s detail=%s", exc.status_code, exc.detail)
             return _telegram_error_response("telegram_send_failed", exc)
@@ -318,11 +320,12 @@ def create_app(
 
         try:
             message = _message_from_request(gateway_config.max_message_chars)
+            parse_mode = _parse_mode_from_request()
         except ValueError as exc:
             logger.warning("bad POST payload on %s: %s", request.path, exc)
             return jsonify({"ok": False, "error": str(exc)}), 400
 
-        return send_message_response(message)
+        return send_message_response(message, parse_mode)
 
     def get_message_handler() -> tuple[Any, int]:
         if not _is_query_authorized(gateway_config.api_auth_token):
@@ -334,7 +337,13 @@ def create_app(
             logger.warning("missing message query on %s", request.path)
             return jsonify({"ok": False, "error": "message query parameter is required"}), 400
 
-        return send_message_response(message)
+        try:
+            parse_mode = _parse_mode_from_request()
+        except ValueError as exc:
+            logger.warning("bad parse_mode on %s: %s", request.path, exc)
+            return jsonify({"ok": False, "error": str(exc)}), 400
+
+        return send_message_response(message, parse_mode)
 
     def patch_message_handler(message_id: int) -> tuple[Any, int]:
         if not _is_authorized(gateway_config.api_auth_token):
@@ -343,12 +352,13 @@ def create_app(
 
         try:
             message = _message_from_request(gateway_config.max_message_chars)
+            parse_mode = _parse_mode_from_request()
         except ValueError as exc:
             logger.warning("bad PATCH payload on %s: %s", request.path, exc)
             return jsonify({"ok": False, "error": str(exc)}), 400
 
         try:
-            client.edit_message(message_id, message)
+            client.edit_message(message_id, message, parse_mode=parse_mode)
         except TelegramError as exc:
             if _is_not_modified(exc.detail):
                 logger.info("telegram message %s unchanged", message_id)
@@ -606,12 +616,61 @@ def _message_from_payload(payload: Any) -> str:
 
         title = payload.get("title")
         if isinstance(title, str) and title.strip():
-            details = {key: value for key, value in payload.items() if key != "title"}
+            details = {
+                key: value
+                for key, value in payload.items()
+                if key != "title" and key not in _PAYLOAD_CONTROL_FIELDS
+            }
             if details:
                 return f"{title.strip()}\n\n{_json_dump(details)}"
             return title.strip()
 
+        if any(key in payload for key in _PAYLOAD_CONTROL_FIELDS):
+            forwarded = {
+                key: value
+                for key, value in payload.items()
+                if key not in _PAYLOAD_CONTROL_FIELDS
+            }
+            if not forwarded:
+                return ""
+            return _json_dump(forwarded)
+
     return _json_dump(payload)
+
+
+# Request-level parse modes. Omitted/null/PLAINTEXT means "send plain text";
+# HTML opts one message into Telegram HTML rendering.
+_REQUEST_PARSE_MODE_ALIASES = {
+    "html": "HTML",
+    "plaintext": None,
+    "plain": None,
+    "text": None,
+    "": None,
+}
+_PAYLOAD_CONTROL_FIELDS = {"parse_mode"}
+
+
+def _normalize_parse_mode(raw: Any) -> str | None:
+    """Validate a request-supplied parse_mode."""
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise ValueError("parse_mode must be a string")
+    text = raw.strip()
+    key = text.lower()
+    if key not in _REQUEST_PARSE_MODE_ALIASES:
+        raise ValueError(f"unsupported parse_mode: {raw!r} (use HTML or PLAINTEXT)")
+    return _REQUEST_PARSE_MODE_ALIASES[key]
+
+
+def _parse_mode_from_request() -> str | None:
+    """Per-message parse_mode from the JSON body, or query string for GET."""
+    payload = request.get_json(silent=True)
+    if isinstance(payload, dict) and "parse_mode" in payload:
+        return _normalize_parse_mode(payload.get("parse_mode"))
+    if "parse_mode" in request.args:
+        return _normalize_parse_mode(request.args.get("parse_mode"))
+    return None
 
 
 def _error_description(detail: Any) -> str:

@@ -1,36 +1,47 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
-from app import GatewayConfig, TelegramError, create_app
+from app import GatewayConfig, TelegramClient, TelegramError, create_app
 
 
 class FakeTelegramClient:
     def __init__(self, result=None, error=None):
         self.messages = []
+        self.parse_modes = []
         self.result = result or {"ok": True, "result": {"message_id": 42}}
         self.error = error
 
-    def send_message(self, text):
+    def send_message(self, text, parse_mode=None):
         self.messages.append(text)
+        self.parse_modes.append(parse_mode)
         if self.error:
             raise self.error
         return self.result
 
 
-def test_config(webhook_path="/api/messages"):
+class FakeTelegramResponse:
+    ok = True
+
+    def json(self):
+        return {"ok": True, "result": {"message_id": 42}}
+
+
+def test_config(webhook_path="/api/messages", telegram_parse_mode=None):
     return GatewayConfig(
         api_auth_token="secret",
         telegram_bot_token="bot-token",
         telegram_chat_id="@channel",
         webhook_path=webhook_path,
+        telegram_parse_mode=telegram_parse_mode,
     )
 
 
 class TelegramGatewayTest(unittest.TestCase):
-    def make_client(self, fake=None, webhook_path="/api/messages"):
+    def make_client(self, fake=None, webhook_path="/api/messages", telegram_parse_mode=None):
         fake = fake or FakeTelegramClient()
-        app = create_app(test_config(webhook_path), fake)
+        app = create_app(test_config(webhook_path, telegram_parse_mode), fake)
         return app.test_client(), fake
 
     def test_health_is_public(self):
@@ -170,6 +181,104 @@ class TelegramGatewayTest(unittest.TestCase):
         self.assertEqual(response.status_code, 202)
         self.assertEqual(fake.messages, ["12345"])
 
+    def test_post_without_parse_mode_sends_plain_text(self):
+        client, fake = self.make_client(telegram_parse_mode="HTML")
+
+        response = client.post(
+            "/api/messages",
+            headers={"Authorization": "Bearer secret"},
+            json={"text": "hello"},
+        )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(fake.parse_modes, [None])
+
+    def test_post_parse_mode_html_is_passed_through(self):
+        client, fake = self.make_client()
+
+        response = client.post(
+            "/api/messages",
+            headers={"Authorization": "Bearer secret"},
+            json={"text": '<a href="x">y</a>', "parse_mode": "HTML"},
+        )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(fake.messages, ['<a href="x">y</a>'])
+        self.assertEqual(fake.parse_modes, ["HTML"])
+
+    def test_post_parse_mode_html_is_case_insensitive(self):
+        client, fake = self.make_client()
+
+        response = client.post(
+            "/api/messages",
+            headers={"Authorization": "Bearer secret"},
+            json={"text": "x", "parse_mode": "html"},
+        )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(fake.parse_modes, ["HTML"])
+
+    def test_post_plaintext_parse_mode_forces_plain(self):
+        client, fake = self.make_client(telegram_parse_mode="HTML")
+
+        response = client.post(
+            "/api/messages",
+            headers={"Authorization": "Bearer secret"},
+            json={"text": "x", "parse_mode": "PLAINTEXT"},
+        )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(fake.parse_modes, [None])
+
+    def test_post_invalid_parse_mode_is_rejected(self):
+        client, fake = self.make_client()
+
+        response = client.post(
+            "/api/messages",
+            headers={"Authorization": "Bearer secret"},
+            json={"text": "x", "parse_mode": "bogus"},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("unsupported parse_mode", response.get_json()["error"])
+        self.assertEqual(fake.messages, [])  # nothing sent
+
+    def test_get_parse_mode_query_is_passed_through(self):
+        client, fake = self.make_client()
+
+        response = client.get("/api/messages?token=secret&message=hi&parse_mode=HTML")
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(fake.parse_modes, ["HTML"])
+
+    def test_parse_mode_is_not_forwarded_as_fallback_payload_text(self):
+        client, fake = self.make_client()
+
+        response = client.post(
+            "/api/messages",
+            headers={"Authorization": "Bearer secret"},
+            json={"service": "api", "status": "ok", "parse_mode": "HTML"},
+        )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertIn('"service": "api"', fake.messages[0])
+        self.assertIn('"status": "ok"', fake.messages[0])
+        self.assertNotIn("parse_mode", fake.messages[0])
+        self.assertEqual(fake.parse_modes, ["HTML"])
+
+    def test_parse_mode_only_payload_is_rejected(self):
+        client, fake = self.make_client()
+
+        response = client.post(
+            "/api/messages",
+            headers={"Authorization": "Bearer secret"},
+            json={"parse_mode": "HTML"},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()["error"], "message text is required")
+        self.assertEqual(fake.messages, [])
+
     def test_telegram_error_returns_bad_gateway(self):
         fake = FakeTelegramClient(error=TelegramError(400, {"ok": False, "description": "bad chat"}))
         client, _fake = self.make_client(fake=fake)
@@ -182,6 +291,47 @@ class TelegramGatewayTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 502)
         self.assertEqual(response.get_json()["error"], "telegram_send_failed")
+
+
+class TelegramClientPayloadTest(unittest.TestCase):
+    def test_send_message_html_parse_mode_sets_telegram_payload(self):
+        payloads = []
+        client = TelegramClient(test_config())
+
+        def fake_post(_url, json, timeout):
+            payloads.append(json)
+            return FakeTelegramResponse()
+
+        with patch("app.requests.post", side_effect=fake_post):
+            client.send_message("<b>hello</b>", parse_mode="HTML")
+
+        self.assertEqual(payloads[0]["parse_mode"], "HTML")
+
+    def test_send_message_plain_parse_mode_omits_telegram_payload_field(self):
+        payloads = []
+        client = TelegramClient(test_config(telegram_parse_mode="HTML"))
+
+        def fake_post(_url, json, timeout):
+            payloads.append(json)
+            return FakeTelegramResponse()
+
+        with patch("app.requests.post", side_effect=fake_post):
+            client.send_message("<b>hello</b>", parse_mode=None)
+
+        self.assertNotIn("parse_mode", payloads[0])
+
+    def test_send_message_default_still_uses_legacy_global_parse_mode(self):
+        payloads = []
+        client = TelegramClient(test_config(telegram_parse_mode="HTML"))
+
+        def fake_post(_url, json, timeout):
+            payloads.append(json)
+            return FakeTelegramResponse()
+
+        with patch("app.requests.post", side_effect=fake_post):
+            client.send_message("<b>hello</b>")
+
+        self.assertEqual(payloads[0]["parse_mode"], "HTML")
 
 
 if __name__ == "__main__":

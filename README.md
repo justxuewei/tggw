@@ -24,6 +24,17 @@ curl -X POST https://tggw.example.com/api/messages \
   -d '{"text":"deployment finished"}'
 ```
 
+Messages are sent as plain text by default. To render one message as Telegram HTML, add `parse_mode: "HTML"` to the JSON body:
+
+```bash
+curl -X POST https://tggw.example.com/api/messages \
+  -H "Authorization: Bearer $API_AUTH_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"text":"<b>deployment finished</b>","parse_mode":"HTML"}'
+```
+
+Set `parse_mode` to `"PLAINTEXT"` or omit it to send plain text.
+
 For multiple paragraphs with `POST`, put `\n\n` in the JSON string:
 
 ```bash
@@ -33,7 +44,7 @@ curl -X POST https://tggw.example.com/api/messages \
   -d '{"text":"first paragraph\n\nsecond paragraph"}'
 ```
 
-If none of those fields are present, the gateway forwards the whole JSON payload as pretty-printed text. Plain text request bodies are also accepted.
+If none of those fields are present, the gateway forwards the whole JSON payload as pretty-printed text. The `parse_mode` control field is not included in that fallback text. Plain text request bodies are also accepted.
 
 For quick manual sends, `GET /api/messages?token=...&message=...` is also available:
 
@@ -49,7 +60,7 @@ curl 'https://tggw.example.com/api/messages?token=replace-with-a-long-random-sec
 
 ## Editing Messages
 
-`PATCH /api/messages/<message_id>` edits an existing Telegram message in place. The body is read the same way as `POST` (`text`, `message`, `body`, or raw text), and the same auth headers apply:
+`PATCH /api/messages/<message_id>` edits an existing Telegram message in place. The body is read the same way as `POST` (`text`, `message`, `body`, `parse_mode`, or raw text), and the same auth headers apply:
 
 ```bash
 curl -X PATCH https://tggw.example.com/api/messages/4242 \
@@ -163,6 +174,6 @@ make push IMAGE=xavierniu/tggw TAG=v1.0.0
 | `TZ` | `UTC` | Timezone for the `started`/`updated` timestamps. The image ships `tzdata`. |
 | `PORT` | `8080` | Local Flask dev server port. Gunicorn in Docker listens on `8080`. |
 | `DOMAIN` | required for Compose TLS | Public hostname used by Caddy for HTTPS. |
-| `TELEGRAM_PARSE_MODE` | empty | Optional Telegram parse mode, for example `HTML` or `MarkdownV2`. |
+| `TELEGRAM_PARSE_MODE` | empty | Legacy lower-level Telegram client default. HTTP message endpoints send plaintext unless the request sets `parse_mode` to `HTML`. |
 | `TELEGRAM_TIMEOUT_SECONDS` | `10` | Telegram API request timeout. |
 | `MAX_MESSAGE_CHARS` | `3900` | Maximum message length before truncation. Must be no more than Telegram's 4096 character limit. |

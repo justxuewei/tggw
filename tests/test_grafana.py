@@ -538,6 +538,19 @@ class EditEndpointTest(unittest.TestCase):
         self.assertEqual(response.get_json()["telegram_message_id"], 42)
         self.assertEqual(fake.edited, [(42, "updated")])
 
+    def test_patch_passes_parse_mode(self):
+        client, fake = self.make_client()
+
+        response = client.patch(
+            "/api/messages/42",
+            headers={"Authorization": "Bearer secret"},
+            json={"text": "<b>updated</b>", "parse_mode": "HTML"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake.edited, [(42, "<b>updated</b>")])
+        self.assertEqual(fake.edit_parse_modes, ["HTML"])
+
     def test_patch_not_modified_is_ok(self):
         fake = FakeTelegramClient()
         fake.edit_error = not_modified_error()
