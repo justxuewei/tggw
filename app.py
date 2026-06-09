@@ -259,6 +259,12 @@ class RecordStore:
             self._conn.commit()
             return cursor.rowcount
 
+    def count(self) -> int:
+        """Return the number of tracked records, exercising the DB connection."""
+        with self._lock:
+            row = self._conn.execute("SELECT COUNT(*) FROM messages").fetchone()
+        return int(row[0])
+
 
 def create_app(
     config: GatewayConfig | None = None,
@@ -271,6 +277,7 @@ def create_app(
     client = telegram_client or TelegramClient(gateway_config)
     store = record_store or RecordStore(gateway_config.record_db_path)
     now = clock or time.time
+    started_at = now()
 
     app = Flask(__name__)
 
@@ -296,6 +303,26 @@ def create_app(
     @app.get("/health")
     def health() -> tuple[Any, int]:
         return jsonify({"ok": True}), 200
+
+    @app.get("/healthz")
+    def healthz() -> tuple[Any, int]:
+        current = now()
+        try:
+            tracked = store.count()
+            db_ok = True
+        except Exception:  # noqa: BLE001 - report any DB failure as unhealthy
+            logger.exception("healthz: record store check failed")
+            tracked = None
+            db_ok = False
+        ok = db_ok
+        page = _render_healthz(
+            ok=ok,
+            db_ok=db_ok,
+            tracked=tracked,
+            started_at=started_at,
+            uptime_seconds=current - started_at,
+        )
+        return page, (200 if ok else 503), {"Content-Type": "text/html; charset=utf-8"}
 
     def send_message_response(message: str, parse_mode: str | None = None) -> tuple[Any, int]:
         try:
@@ -721,6 +748,68 @@ def _format_duration(seconds: float) -> str:
         return f"{hours}h{minutes}m"
     days, hours = divmod(hours, 24)
     return f"{days}d{hours}h{minutes}m"
+
+
+def _render_healthz(
+    *,
+    ok: bool,
+    db_ok: bool,
+    tracked: int | None,
+    started_at: float,
+    uptime_seconds: float,
+) -> str:
+    """Render a small self-contained HTML status page for the gateway."""
+    status_label = "Healthy" if ok else "Unhealthy"
+    accent = "#16a34a" if ok else "#dc2626"
+    db_label = "ok" if db_ok else "error"
+    tracked_label = "—" if tracked is None else str(tracked)
+    rows = (
+        ("Status", status_label),
+        ("Database", db_label),
+        ("Tracked records", tracked_label),
+        ("Uptime", _format_duration(uptime_seconds)),
+        ("Started", _format_time(started_at)),
+    )
+    rows_html = "\n".join(
+        f'      <tr><th>{html.escape(name)}</th>'
+        f"<td>{html.escape(value)}</td></tr>"
+        for name, value in rows
+    )
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>tggw health</title>
+  <style>
+    :root {{ color-scheme: light dark; }}
+    body {{ margin: 0; min-height: 100vh; display: grid; place-items: center;
+      font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, sans-serif;
+      background: #0b0f17; color: #e5e7eb; }}
+    .card {{ background: #111827; border: 1px solid #1f2937; border-radius: 12px;
+      padding: 28px 32px; min-width: 320px; box-shadow: 0 10px 30px rgba(0,0,0,.35); }}
+    h1 {{ margin: 0 0 4px; font-size: 18px; display: flex; align-items: center; gap: 10px; }}
+    .dot {{ width: 12px; height: 12px; border-radius: 50%; background: {accent};
+      box-shadow: 0 0 0 4px {accent}22; }}
+    .sub {{ margin: 0 0 20px; color: #9ca3af; font-size: 13px; }}
+    table {{ width: 100%; border-collapse: collapse; }}
+    th, td {{ text-align: left; padding: 8px 0; border-bottom: 1px solid #1f2937; }}
+    th {{ color: #9ca3af; font-weight: 500; }}
+    td {{ text-align: right; font-variant-numeric: tabular-nums; }}
+    tr:last-child th, tr:last-child td {{ border-bottom: 0; }}
+  </style>
+</head>
+<body>
+  <main class="card">
+    <h1><span class="dot"></span>tggw — {html.escape(status_label)}</h1>
+    <p class="sub">Telegram gateway health check</p>
+    <table>
+{rows_html}
+    </table>
+  </main>
+</body>
+</html>
+"""
 
 
 def _with_timeline(text: str, started: float, updated: float, max_chars: int) -> str:

@@ -52,6 +52,17 @@ class TelegramGatewayTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json(), {"ok": True})
 
+    def test_healthz_page_is_public(self):
+        client, _fake = self.make_client()
+
+        response = client.get("/healthz")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.content_type.startswith("text/html"))
+        body = response.get_data(as_text=True)
+        self.assertIn("Healthy", body)
+        self.assertIn("Tracked records", body)
+
     def test_missing_auth_is_rejected(self):
         client, fake = self.make_client()
 

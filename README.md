@@ -97,7 +97,7 @@ Telegram pushes a notification only for *new* messages; edits are silent. So the
 
 Point a Grafana webhook contact point at this path with `httpMethod: POST` and a `Bearer` token. Records untouched for `RECORD_TTL_HOURS` (default 24) are swept automatically.
 
-`GET /health` returns a simple health response and does not require auth.
+`GET /health` returns a simple JSON health response and does not require auth. `GET /healthz` serves a human-readable HTML status page (database connectivity, tracked record count, uptime); it returns `503` if the record store is unreachable.
 
 ## Telegram Setup
 
